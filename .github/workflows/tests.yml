@@ -1,0 +1,67 @@
+name: Tests
+
+# The build on a runner of each platform: every runner assembles all native jars from the llama.cpp release archives and runs the tests
+# with the libraries of its own platform. The runners have no GPU driver, so the tests see the CPU device only; the model tests are
+# skipped: the runners have no model.
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: tests (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-x86_64
+            runner: windows-latest
+          - platform: linux-x86_64
+            runner: ubuntu-24.04
+          - platform: macosx-arm64
+            runner: macos-latest
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Keep line endings
+        run: git config --global core.autocrlf false
+
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Set up the JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: basic
+
+      # The llama.cpp release archives, pinned with their SHA-256 digests in gradle.properties.
+      - name: Cache the llama.cpp archives
+        uses: actions/cache@v5
+        with:
+          path: build/llama/archives
+          key: llama-archives-${{ hashFiles('gradle.properties') }}
+
+      - name: Build and test
+        run: ./gradlew build
+
+      - name: Upload the reports
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reports-${{ matrix.platform }}
+          path: |
+            build/reports/
+            build/test-results/
+          if-no-files-found: ignore
+          retention-days: 14

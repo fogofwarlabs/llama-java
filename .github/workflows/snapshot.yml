@@ -1,0 +1,96 @@
+name: Snapshot
+
+on:
+  push:
+    branches: [develop]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: snapshot
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      snapshot: ${{ steps.version.outputs.snapshot }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Read the version
+        id: version
+        run: |
+          version=$(sed -n 's/^version=//p' gradle.properties | tr -d '\r')
+          if [ -z "$version" ]; then
+            echo "::error::gradle.properties has no version line."
+            exit 1
+          fi
+          case "$version" in
+            *-SNAPSHOT) snapshot=true ;;
+            *)          snapshot=false
+                        echo "::notice::The version $version is no snapshot; nothing is published." ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "snapshot=$snapshot" >> "$GITHUB_OUTPUT"
+
+  tests:
+    name: tests
+    needs: version
+    if: needs.version.outputs.snapshot == 'true'
+    uses: ./.github/workflows/tests.yml
+
+  # The Maven Central snapshot, once, with the native jars of all platforms, assembled from the llama.cpp release archives.
+  snapshot:
+    name: snapshot
+    needs: [version, tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check the secrets
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+        run: |
+          if [ -z "$MAVEN_CENTRAL_USERNAME" ] || [ -z "$MAVEN_CENTRAL_PASSWORD" ]; then
+            echo "::error::Set the repository secrets MAVEN_CENTRAL_USERNAME and MAVEN_CENTRAL_PASSWORD (the Central Portal user token)."
+            exit 1
+          fi
+
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Set up the JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: basic
+
+      - name: Cache the llama.cpp archives
+        uses: actions/cache@v5
+        with:
+          path: build/llama/archives
+          key: llama-archives-${{ hashFiles('gradle.properties') }}
+
+      - name: Publish the snapshot
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyId: ${{ secrets.SIGNING_KEY_ID }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        # An unset secret arrives as an empty variable.
+        run: |
+          if [ -z "$ORG_GRADLE_PROJECT_signingInMemoryKeyId" ]; then
+            unset ORG_GRADLE_PROJECT_signingInMemoryKeyId
+          fi
+          ./gradlew publishToMavenCentral

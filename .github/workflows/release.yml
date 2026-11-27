@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+
+      - name: Read the version
+        id: version
+        run: |
+          version=$(sed -n 's/^version=//p' gradle.properties | tr -d '\r')
+          if [ -z "$version" ]; then
+            echo "::error::gradle.properties has no version line."
+            exit 1
+          fi
+          case "$version" in
+            *-SNAPSHOT)
+              echo "::error::main releases only a release version, not $version: set the version in gradle.properties without -SNAPSHOT."
+              exit 1 ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Refuse an existing tag
+        env:
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null; then
+            echo "::error::The tag $TAG already exists: every release needs a new version in gradle.properties."
+            exit 1
+          fi
+
+      - name: Check the secrets
+        env:
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          SIGNING_IN_MEMORY_KEY: ${{ secrets.SIGNING_KEY }}
+        run: |
+          if [ -z "$MAVEN_CENTRAL_USERNAME" ] || [ -z "$MAVEN_CENTRAL_PASSWORD" ]; then
+            echo "::error::Set the repository secrets MAVEN_CENTRAL_USERNAME and MAVEN_CENTRAL_PASSWORD (the Central Portal user token)."
+            exit 1
+          fi
+          if [ -z "$SIGNING_IN_MEMORY_KEY" ]; then
+            echo "::error::Set the repository secret SIGNING_KEY: Maven Central takes only signed releases."
+            exit 1
+          fi
+
+  tests:
+    name: tests
+    needs: version
+    uses: ./.github/workflows/tests.yml
+
+  # Maven Central once, with the native jars of all platforms assembled from the llama.cpp release archives, then the tag and the GitHub
+  # release.
+  release:
+    name: release
+    needs: [version, tests]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Set up the JDK
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          cache-provider: basic
+
+      - name: Cache the llama.cpp archives
+        uses: actions/cache@v5
+        with:
+          path: build/llama/archives
+          key: llama-archives-${{ hashFiles('gradle.properties') }}
+
+      - name: Publish and release
+        env:
+          ORG_GRADLE_PROJECT_mavenCentralUsername: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          ORG_GRADLE_PROJECT_mavenCentralPassword: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+          ORG_GRADLE_PROJECT_signingInMemoryKey: ${{ secrets.SIGNING_KEY }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyId: ${{ secrets.SIGNING_KEY_ID }}
+          ORG_GRADLE_PROJECT_signingInMemoryKeyPassword: ${{ secrets.SIGNING_KEY_PASSWORD }}
+        # An unset secret arrives as an empty variable.
+        run: |
+          if [ -z "$ORG_GRADLE_PROJECT_signingInMemoryKeyId" ]; then
+            unset ORG_GRADLE_PROJECT_signingInMemoryKeyId
+          fi
+          ./gradlew assemble publishAndReleaseToMavenCentral
+
+      - name: Tag and create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # The notes list the commits since the previous release tag, without the version changes and the release merges.
+          previous=$(git describe --tags --abbrev=0 --match 'v*' "$GITHUB_SHA^" 2>/dev/null || true)
+          {
+            echo "## What's Changed"
+            git log --no-merges --format='* %s' "${previous:+$previous..}$GITHUB_SHA" | grep -v '^\* Bump version to ' || true
+
+            if [ -n "$previous" ]; then
+              echo
+              echo "**Full Changelog**: https://github.com/$GITHUB_REPOSITORY/compare/$previous...$TAG"
+            fi
+          } > release-notes.md
+
+          gh release create "$TAG" build/libs/llama-java-"$VERSION"-{windows-x86_64,linux-x86_64,macosx-arm64}.jar --target "$GITHUB_SHA" \
+            --title "$TAG" --notes-file release-notes.md

@@ -1,0 +1,262 @@
+import com.vanniktech.maven.publish.DeploymentValidation
+import com.vanniktech.maven.publish.JavaLibrary
+import com.vanniktech.maven.publish.JavadocJar
+import com.vanniktech.maven.publish.SourcesJar
+
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
+
+plugins {
+    id 'java-library'
+    id 'com.vanniktech.maven.publish' version '0.37.0'
+}
+
+// The platforms of the native jars. Every native jar is assembled from the official llama.cpp release archive of its platform, so one
+// machine builds all of them.
+def supportedPlatforms = ['windows-x86_64', 'linux-x86_64', 'macosx-arm64']
+def detectPlatform = {
+    def osName = System.getProperty('os.name').toLowerCase(Locale.ROOT)
+    def osArch = System.getProperty('os.arch').toLowerCase(Locale.ROOT)
+    def os = osName.startsWith('windows') ? 'windows' : osName.startsWith('mac') ? 'macosx' : osName.startsWith('linux') ? 'linux' : osName
+    def arch = osArch in ['amd64', 'x86_64'] ? 'x86_64' : osArch in ['aarch64', 'arm64'] ? 'arm64' : osArch
+    return os + '-' + arch
+}
+def hostPlatform = detectPlatform()
+def llamaBuild = providers.gradleProperty('llamaBuild').get()
+
+// The libraries of each platform that the API needs: llama, ggml, ggml-base, the CPU backend (the CPU variants on x86_64), the GPU backend
+// and the OpenMP runtime of Windows; on macOS also the BLAS and RPC backends, which libggml links to. Patterns of the archive entries; the
+// versioned file names of Linux and macOS become the names that the libraries link to (libllama.so.1.1.0 -> libllama.so.1).
+def platformLibraries = [
+    'windows-x86_64': ['llama.dll', 'ggml.dll', 'ggml-base.dll', 'ggml-cpu-*.dll', 'ggml-vulkan.dll', 'libomp.dll'],
+    'linux-x86_64'  : ['libllama.so.*.*.*', 'libggml.so.*.*.*', 'libggml-base.so.*.*.*', 'libggml-cpu-*.so', 'libggml-vulkan.so'],
+    'macosx-arm64'  : ['libllama.*.*.*.dylib', 'libggml.*.*.*.dylib', 'libggml-base.*.*.*.dylib', 'libggml-cpu.*.*.*.dylib',
+                       'libggml-blas.*.*.*.dylib', 'libggml-metal.*.*.*.dylib', 'libggml-rpc.*.*.*.dylib']
+]
+// The licence texts of licenses/ that the native jar of each platform carries.
+def platformLicenses = [
+    'windows-x86_64': ['llama.cpp-MIT.txt', 'LLVM-OpenMP-Apache-2.0-WITH-LLVM-exception.txt'],
+    'linux-x86_64'  : ['llama.cpp-MIT.txt'],
+    'macosx-arm64'  : ['llama.cpp-MIT.txt']
+]
+def linkedLibraryName = { String name ->
+    return name.replaceFirst(/^(lib.+\.so\.\d+)\.\d+\.\d+$/, '$1').replaceFirst(/^(lib.+\.\d+)\.\d+\.\d+\.dylib$/, '$1.dylib')
+}
+def sha256 = { File file ->
+    def digest = MessageDigest.getInstance('SHA-256')
+    file.withInputStream { input ->
+        byte[] buffer = new byte[1 << 16]
+        int count
+        while ((count = input.read(buffer)) > 0) {
+            digest.update(buffer, 0, count)
+        }
+    }
+    return digest.digest().encodeHex().toString()
+}
+
+def licenseFiles = files('LICENSE', 'NOTICE')
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(25)
+    }
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    compileOnly 'org.jetbrains:annotations:23.0.0'
+
+    testCompileOnly 'org.jetbrains:annotations:23.0.0'
+    testImplementation platform('org.junit:junit-bom:5.11.4')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.release = 25
+}
+
+// The llama.cpp build in the resource that LlamaRuntime reads.
+tasks.named('processResources', ProcessResources) {
+    inputs.property('llamaBuild', llamaBuild)
+    filesMatching('org/fogofwarlabs/llama/llama-java.properties') {
+        expand(llamaBuild: llamaBuild)
+    }
+}
+
+// Per platform: the download of the release archive with its SHA-256 check, the libraries of the API with the licence texts and the list
+// that the loader extracts (build/llama/natives/<platform>), and the native jar.
+def nativeJars = [:]
+supportedPlatforms.each { platform ->
+    def taskSuffix = platform.split('-').collect { part -> part.capitalize() }.join('')
+    def archiveName = providers.gradleProperty('llamaArchive.' + platform).get()
+    def archiveSha256 = providers.gradleProperty('llamaSha256.' + platform).get()
+    def archiveUrl = 'https://github.com/ggml-org/llama.cpp/releases/download/' + llamaBuild + '/' + archiveName
+    def archiveFile = layout.buildDirectory.file('llama/archives/' + archiveName)
+    def nativePath = 'org/fogofwarlabs/llama/' + platform
+    def stageDirectory = layout.buildDirectory.dir('llama/natives/' + platform)
+
+    def download = tasks.register('downloadLlama' + taskSuffix) {
+        group = 'build'
+        description = 'Downloads ' + archiveName + ' and checks its SHA-256 digest.'
+        inputs.property('archiveUrl', archiveUrl)
+        inputs.property('archiveSha256', archiveSha256)
+        outputs.file(archiveFile)
+        doLast {
+            def file = archiveFile.get().asFile
+            if (file.isFile() && sha256(file) == archiveSha256) {
+                return
+            }
+            file.parentFile.mkdirs()
+            def partial = new File(file.path + '.part')
+            new URI(archiveUrl).toURL().withInputStream { input ->
+                Files.copy(input, partial.toPath(), StandardCopyOption.REPLACE_EXISTING)
+            }
+            def actual = sha256(partial)
+            if (actual != archiveSha256) {
+                partial.delete()
+                throw new GradleException('The SHA-256 digest of ' + archiveName + ' is ' + actual + ', not ' + archiveSha256 + '.')
+            }
+            Files.move(partial.toPath(), file.toPath(), StandardCopyOption.REPLACE_EXISTING)
+        }
+    }
+
+    def stage = tasks.register('stageLlama' + taskSuffix, Sync) {
+        group = 'build'
+        description = 'Collects the native libraries and licence texts of ' + platform + '.'
+        dependsOn download
+        def archiveEntries = []
+        from({ archiveName.endsWith('.zip') ? zipTree(archiveFile) : tarTree(archiveFile) }) {
+            include platformLibraries[platform].collect { pattern -> '**/' + pattern }
+            eachFile { details ->
+                archiveEntries << details.name
+                details.path = nativePath + '/' + linkedLibraryName(details.name)
+            }
+            includeEmptyDirs = false
+        }
+        from(file('licenses')) {
+            include platformLicenses[platform]
+            into nativePath + '/licenses'
+        }
+        into stageDirectory
+        doFirst {
+            archiveEntries.clear()
+        }
+        doLast {
+            platformLibraries[platform].each { pattern ->
+                def regex = pattern.replace('.', '\\.').replace('*', '.*')
+                if (!archiveEntries.any { name -> name ==~ regex }) {
+                    throw new GradleException('The archive ' + archiveName + ' has no library ' + pattern + '.')
+                }
+            }
+            def directory = stageDirectory.get().dir(nativePath).asFile
+            def libraries = directory.listFiles().findAll { file -> file.isFile() }.collect { file -> file.name }.sort()
+            new File(directory, 'libraries.list').setText(libraries.join('\n') + '\n', 'UTF-8')
+        }
+    }
+
+    nativeJars[platform] = tasks.register('nativeJar' + taskSuffix, Jar) {
+        group = 'build'
+        description = 'Assembles the native jar of ' + platform + '.'
+        archiveClassifier = platform
+        from(stage)
+    }
+
+    // The tests load the libraries of this machine from the class path.
+    if (platform == hostPlatform) {
+        dependencies {
+            testRuntimeOnly files(stageDirectory).builtBy(stage)
+        }
+    }
+}
+
+tasks.named('assemble') {
+    dependsOn nativeJars.values()
+}
+
+tasks.withType(Jar).configureEach {
+    metaInf {
+        from(licenseFiles)
+    }
+}
+
+tasks.withType(Javadoc).configureEach {
+    options.encoding = 'UTF-8'
+    // The generated classes of org.fogofwarlabs.llama.bindings carry the C declarations, not complete javadoc.
+    options.addBooleanOption('Xdoclint:none', true)
+    options.addStringOption('Xmaxwarns', '1')
+}
+
+tasks.named('test', Test) {
+    useJUnitPlatform()
+    jvmArgs '--enable-native-access=ALL-UNNAMED'
+    // The model test runs with -Pllama.test.model=<GGUF file> or the environment variable LLAMA_TEST_MODEL, and is skipped without it.
+    def model = providers.gradleProperty('llama.test.model').orElse(providers.environmentVariable('LLAMA_TEST_MODEL'))
+    if (model.isPresent()) {
+        systemProperty 'llama.test.model', model.get()
+    }
+    systemProperty 'org.fogofwarlabs.llama.cachedir', layout.buildDirectory.dir('tmp/llama-cache').get().asFile.absolutePath
+    testLogging {
+        events 'passed', 'skipped', 'failed'
+        showStandardStreams = true
+        exceptionFormat = 'full'
+    }
+}
+
+// Publishing: the Java classes, the sources and the javadoc, and the native jar of every platform as classifiers of the same artifact.
+def projectUrl = 'https://github.com/fogofwarlabs/llama-java'
+def signingKey = providers.gradleProperty('signingInMemoryKey').filter { key -> !key.isBlank() }
+
+mavenPublishing {
+    configure(new JavaLibrary(new JavadocJar.Javadoc(), new SourcesJar.Sources()))
+    coordinates(project.group.toString(), 'llama-java', project.version.toString())
+    publishToMavenCentral(true, DeploymentValidation.VALIDATED)
+    // publishToMavenLocal works without a key.
+    if (signingKey.isPresent()) {
+        signAllPublications()
+    }
+    pom {
+        name = 'llama-java'
+        description = 'Java bindings for llama.cpp through the Foreign Function & Memory API, with the native libraries of the official ' +
+                      'llama.cpp builds for Windows, Linux and macOS.'
+        url = projectUrl
+        licenses {
+            license {
+                name = 'Apache-2.0'
+                url = 'https://www.apache.org/licenses/LICENSE-2.0.txt'
+            }
+            license {
+                name = 'MIT (llama.cpp)'
+                url = 'https://github.com/ggml-org/llama.cpp/blob/master/LICENSE'
+            }
+        }
+        developers {
+            developer {
+                id = 'fogofwarlabs'
+                name = 'Fog of War Labs'
+                url = 'https://fogofwarlabs.org'
+            }
+        }
+        scm {
+            url = projectUrl
+            connection = 'scm:git:' + projectUrl + '.git'
+            developerConnection = 'scm:git:ssh://git@github.com/fogofwarlabs/llama-java.git'
+        }
+    }
+}
+
+publishing.publications.withType(MavenPublication).configureEach { publication ->
+    nativeJars.values().each { nativeJar ->
+        publication.artifact(nativeJar)
+    }
+}
+
+// Plain POM metadata: the native jars are classifiers, which Gradle module metadata has no variant for.
+tasks.withType(GenerateModuleMetadata).configureEach {
+    enabled = false
+}

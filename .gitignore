@@ -1,0 +1,13 @@
+# Gradle
+.gradle/
+build/
+
+# IntelliJ
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Crash logs
+hs_err_pid*.log
+replay_pid*.log
